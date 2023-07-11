@@ -1,13 +1,12 @@
 //! About the smallest drawing API you could ask for
 use std::{
     alloc::{alloc, dealloc, handle_alloc_error, Layout},
-    collections::HashMap,
     ffi::CString,
 };
 use x11::{
     xft::{
-        FcPattern, XftColor, XftColorAllocName, XftFont, XftFontClose, XftFontOpenName,
-        XftNameParse,
+        FcPattern, XftColor, XftColorAllocName, XftDrawCreate, XftFont, XftFontClose,
+        XftFontOpenName, XftNameParse,
     },
     xlib::{
         CapButt, Display, Drawable, False, JoinMiter, LineSolid, Window, XCopyArea, XCreateGC,
@@ -51,6 +50,7 @@ struct Font {
 }
 
 struct ColorScheme {
+    name: String,
     fg: *mut XftColor,
     bg: *mut XftColor,
 }
@@ -74,14 +74,12 @@ pub struct Rect {
 }
 
 pub struct Draw {
-    w: u32,
-    h: u32,
     dpy: *mut Display,
     root: Window,
     drawable: Drawable,
     gc: GC,
-    schemes: HashMap<String, ColorScheme>,
-    fonts: HashMap<String, Font>,
+    schemes: Vec<ColorScheme>,
+    fonts: Vec<Font>,
 }
 
 impl Draw {
@@ -98,14 +96,12 @@ impl Draw {
         };
 
         Self {
-            w,
-            h,
             dpy,
             root,
             drawable,
             gc,
-            schemes: HashMap::new(),
-            fonts: HashMap::new(),
+            schemes: Vec::new(),
+            fonts: Vec::new(),
         }
     }
 
@@ -123,9 +119,9 @@ impl Draw {
     pub fn set_fonts(&mut self, font_names: &[&str]) -> Result<()> {
         self.free_fonts();
 
-        let mut fonts = HashMap::with_capacity(font_names.len());
+        let mut fonts = Vec::with_capacity(font_names.len());
         for name in font_names {
-            fonts.insert(name.to_string(), self.font_from_name(name)?);
+            fonts.push(self.font_from_name(name)?);
         }
 
         self.fonts = fonts;
@@ -133,9 +129,25 @@ impl Draw {
         Ok(())
     }
 
+    pub fn set_colorscheme(&mut self, scheme: &str) -> Result<()> {
+        let ix = self
+            .schemes
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.name == scheme)
+            .map(|(i, _)| i)
+            .ok_or_else(|| Error::UnknownColorscheme(scheme.to_string()))?;
+
+        if ix != 0 {
+            self.schemes.swap(0, ix);
+        }
+
+        Ok(())
+    }
+
     fn free_fonts(&mut self) {
         unsafe {
-            for (_, f) in self.fonts.drain() {
+            for f in self.fonts.drain(0..) {
                 XftFontClose(self.dpy, f.xfont);
             }
         }
@@ -166,10 +178,11 @@ impl Draw {
     // TODO: should accept impl Into<penrose::Color>
     pub fn add_colorscheme(&mut self, name: &str, fg: &str, bg: &str) -> Result<()> {
         let cs = ColorScheme {
+            name: name.to_string(),
             fg: self.color_from_name(fg)?,
             bg: self.color_from_name(bg)?,
         };
-        self.schemes.insert(name.to_string(), cs);
+        self.schemes.push(cs);
 
         Ok(())
     }
@@ -204,24 +217,17 @@ impl Draw {
         unsafe {
             let layout = Layout::new::<XftColor>();
 
-            for (_, ColorScheme { fg, bg }) in self.schemes.drain() {
+            for ColorScheme { fg, bg, .. } in self.schemes.drain(0..) {
                 for ptr in [fg, bg] {
+                    // TODO: check if this should be done use XftFreeColor
                     dealloc(ptr as *mut u8, layout);
                 }
             }
         }
     }
 
-    pub fn draw_rect(
-        &mut self,
-        scheme: &str,
-        Rect { x, y, w, h }: Rect,
-        inverted: bool,
-    ) -> Result<()> {
-        let scheme = self
-            .schemes
-            .get(scheme)
-            .ok_or_else(|| Error::UnknownColorscheme(scheme.to_string()))?;
+    pub fn draw_rect(&mut self, Rect { x, y, w, h }: Rect, inverted: bool) -> Result<()> {
+        let scheme = &self.schemes[0];
 
         unsafe {
             let pixel = if inverted { scheme.bg() } else { scheme.fg() };
@@ -232,19 +238,11 @@ impl Draw {
         Ok(())
     }
 
-    pub fn fill_rect(
-        &mut self,
-        scheme: &str,
-        Rect { x, y, w, h }: Rect,
-        inverted: bool,
-    ) -> Result<()> {
-        let scheme = self
-            .schemes
-            .get(scheme)
-            .ok_or_else(|| Error::UnknownColorscheme(scheme.to_string()))?;
+    pub fn fill_rect(&mut self, Rect { x, y, w, h }: Rect, invert: bool) -> Result<()> {
+        let scheme = &self.schemes[0];
 
         unsafe {
-            let pixel = if inverted { scheme.bg() } else { scheme.fg() };
+            let pixel = if invert { scheme.bg() } else { scheme.fg() };
             XSetForeground(self.dpy, self.gc, pixel);
             XFillRectangle(self.dpy, self.drawable, self.gc, x, y, w, h);
         }
@@ -252,7 +250,30 @@ impl Draw {
         Ok(())
     }
 
-    pub fn flush_to(&mut self, win: Window, Rect { x, y, w, h }: Rect) {
+    pub fn draw_text(&mut self, txt: &str, lpad: u32, r: Rect, invert: bool) -> Result<()> {
+        self.fill_rect(r, !invert)?; // !invert so we get the other color
+
+        let d = unsafe {
+            XftDrawCreate(
+                self.dpy,
+                self.drawable,
+                XDefaultVisual(self.dpy, SCREEN),
+                XDefaultColormap(self.dpy, SCREEN),
+            )
+        };
+
+        let Rect { mut x, y, mut w, h } = r;
+        w += lpad;
+        x -= lpad as i32;
+
+        todo!("deal with strings and font rendering in C");
+
+        Ok(())
+    }
+
+    pub fn flush_to(&mut self, win: u32, Rect { x, y, w, h }: Rect) {
+        let win = win as Window;
+
         unsafe {
             XCopyArea(self.dpy, self.drawable, win, self.gc, x, y, w, h, x, y);
             XSync(self.dpy, False);
@@ -273,4 +294,3 @@ impl Drop for Draw {
 
 // unsigned int drw_fontset_getwidth(Drw *drw, const char *text);
 // void drw_font_getexts(Fnt *font, const char *text, unsigned int len, unsigned int *w, unsigned int *h);
-// void drw_rect(Drw *drw, int x, int y, unsigned int w, unsigned int h, int filled, int invert);

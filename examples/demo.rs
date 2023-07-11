@@ -34,8 +34,9 @@ fn main() -> anyhow::Result<()> {
     for n in 0..4 {
         let scheme = if n % 2 == 0 { "primary" } else { "secondary" };
         let invert = n >= 2;
-        drw.fill_rect(scheme, r, invert)?;
-        drw.flush_to(*w as u64, r);
+        drw.set_colorscheme(scheme)?;
+        drw.fill_rect(r, invert)?;
+        drw.flush_to(*w, r);
         conn.map(w)?;
 
         std::thread::sleep(std::time::Duration::from_secs(1));
