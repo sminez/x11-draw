@@ -14,7 +14,7 @@ use x11::{
     xft::{
         FcPattern, FcResult, XftCharExists, XftColor, XftColorAllocName, XftDrawCreate,
         XftDrawStringUtf8, XftFont, XftFontClose, XftFontMatch, XftFontOpenName,
-        XftFontOpenPattern, XftNameParse, XftNameUnparse, XftTextExtentsUtf8,
+        XftFontOpenPattern, XftNameParse, XftTextExtentsUtf8,
     },
     xlib::{
         CapButt, Display, Drawable, False, JoinMiter, LineSolid, Window, XCloseDisplay, XCopyArea,
@@ -63,7 +63,6 @@ type Result<T> = std::result::Result<T, Error>;
 // https://refspecs.linuxfoundation.org/fontconfig-2.6.0/index.html
 #[derive(Debug)]
 struct Font {
-    name: String,
     h: i32,
     xfont: *mut XftFont,
     pattern: Option<*mut FcPattern>,
@@ -89,16 +88,11 @@ impl Font {
             (xfont, Some(pattern), h)
         };
 
-        Ok(Font {
-            name: name.to_string(),
-            xfont,
-            pattern,
-            h,
-        })
+        Ok(Font { xfont, pattern, h })
     }
 
     fn try_new_from_pattern(dpy: *mut Display, pat: *mut FcPattern) -> Result<Self> {
-        let (name, xfont, h) = unsafe {
+        let (xfont, h) = unsafe {
             let xfont = XftFontOpenPattern(dpy, pat);
             if xfont.is_null() {
                 return Err(Error::UnableToOpenFontPattern);
@@ -106,15 +100,10 @@ impl Font {
 
             let h = (*xfont).ascent + (*xfont).descent;
 
-            let buffer = CString::new(vec![b' '; 1024]).unwrap();
-            XftNameUnparse(pat, buffer.as_ptr() as *mut _, 1024);
-            let name = buffer.into_string().expect("valid utf8");
-
-            (name, xfont, h)
+            (xfont, h)
         };
 
         Ok(Font {
-            name,
             xfont,
             pattern: None,
             h,
@@ -255,7 +244,7 @@ pub struct Rect {
     pub h: u32,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum FontMatch {
     Primary,
     Fallback(usize),
@@ -398,10 +387,48 @@ impl Draw {
     }
 
     pub fn show_font_match_for_chars(&mut self, txt: &str) {
-        for c in txt.chars() {
-            println!("'{c}' -> {:?}", self.fnt_for_char(c));
+        for (chunk, fm) in self.per_font_chunks(txt) {
+            println!("'{chunk}' -> {fm:?}");
         }
     }
+
+    // Find boundaries where we need to change the font we are using for rendering utf8
+    // characters from the given input.
+    fn per_font_chunks<'a>(&mut self, txt: &'a str) -> Vec<(&'a str, FontMatch)> {
+        let mut char_indices = txt.char_indices();
+        let mut chunks = Vec::new();
+        let mut last_split = 0;
+        let mut chunk: &str;
+        let mut rest = txt;
+
+        let mut cur_fm = match char_indices.next() {
+            Some((_, c)) => self.fnt_for_char(c),
+            None => return chunks, // empty string: no chunks
+        };
+
+        for (i, c) in char_indices {
+            let fm = self.fnt_for_char(c);
+            if fm != cur_fm {
+                (chunk, rest) = rest.split_at(i - last_split);
+                chunks.push((chunk, cur_fm));
+                cur_fm = fm;
+                last_split = i;
+            }
+        }
+
+        if !rest.is_empty() {
+            chunks.push((rest, cur_fm));
+        }
+
+        chunks
+    }
+
+    // fn fnt(&self, fm: FontMatch) -> &Font {
+    //     match fm {
+    //         FontMatch::Primary => &self.fnt,
+    //         FontMatch::Fallback(n) => &self.fnt_fallback[n],
+    //     }
+    // }
 
     fn fnt_for_char(&mut self, c: char) -> FontMatch {
         if let Some(fm) = self.char_cache.get(&c) {

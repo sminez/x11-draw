@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
 
     // std::thread::sleep(std::time::Duration::from_secs(5));
 
-    drw.show_font_match_for_chars("    text is great");
+    drw.show_font_match_for_chars("foo     text is great");
 
     Ok(())
 }
