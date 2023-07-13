@@ -148,7 +148,7 @@ pub(crate) enum FontMatch {
 pub(crate) struct Font {
     h: i32,
     pub(crate) xfont: *mut XftFont,
-    pattern: Option<*mut FcPattern>,
+    pattern: *mut FcPattern,
 }
 
 impl Font {
@@ -168,15 +168,15 @@ impl Font {
 
             let h = (*xfont).ascent + (*xfont).descent;
 
-            (xfont, Some(pattern), h)
+            (xfont, pattern, h)
         };
 
         Ok(Font { xfont, pattern, h })
     }
 
-    fn try_new_from_pattern(dpy: *mut Display, pat: *mut FcPattern) -> Result<Self> {
+    fn try_new_from_pattern(dpy: *mut Display, pattern: *mut FcPattern) -> Result<Self> {
         let (xfont, h) = unsafe {
-            let xfont = XftFontOpenPattern(dpy, pat);
+            let xfont = XftFontOpenPattern(dpy, pattern);
             if xfont.is_null() {
                 return Err(Error::UnableToOpenFontPattern);
             }
@@ -186,11 +186,7 @@ impl Font {
             (xfont, h)
         };
 
-        Ok(Font {
-            xfont,
-            pattern: None,
-            h,
-        })
+        Ok(Font { xfont, pattern, h })
     }
 
     fn contains_char(&self, dpy: *mut Display, c: char) -> bool {
@@ -207,7 +203,7 @@ impl Font {
             }
             let ext = ptr as *mut XGlyphInfo;
 
-            let c_str = CString::new(txt).unwrap();
+            let c_str = CString::new(txt).expect("text to not contain null bytes");
             XftTextExtentsUtf8(
                 dpy,
                 self.xfont,
@@ -232,7 +228,7 @@ impl Font {
             let charset = FcCharSetCreate();
             FcCharSetAddChar(charset, c as u32);
 
-            let pat = FcPatternDuplicate(self.pattern.unwrap() as *const _);
+            let pat = FcPatternDuplicate(self.pattern as *const _);
             FcPatternAddCharSet(pat, FC_CHARSET.as_ptr(), charset);
             FcPatternAddBool(pat, FC_SCALABLE.as_ptr(), 1); // FcTrue=1
 
