@@ -10,6 +10,7 @@ const X: u32 = 200;
 const Y: u32 = 100;
 const W: u32 = 600;
 const H: u32 = 60;
+const FONT: &str = "ProFont For Powerline:size=14";
 
 fn main() -> anyhow::Result<()> {
     let conn = RustConn::new()?;
@@ -19,8 +20,7 @@ fn main() -> anyhow::Result<()> {
         false,
     )?;
 
-    let mut drw = Draw::new(*conn.root(), W, H);
-    drw.set_fonts(&["ProFont For Powerline:size=14", "Iosevka Nerd Font:size=14"])?;
+    let mut drw = Draw::new(*conn.root(), W, H, FONT)?;
     drw.add_colorscheme("primary", "#f2e5bc", "#282828")?;
     drw.add_colorscheme("secondary", "#458588", "#b16286")?;
 

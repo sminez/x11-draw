@@ -7,7 +7,8 @@ use fontconfig_sys::{
 };
 use std::{
     alloc::{alloc, dealloc, handle_alloc_error, Layout},
-    ffi::{CStr, CString},
+    collections::HashMap,
+    ffi::CString,
 };
 use x11::{
     xft::{
@@ -60,6 +61,7 @@ type Result<T> = std::result::Result<T, Error>;
 //
 // https://man.archlinux.org/man/extra/libxft/XftFontMatch.3.en
 // https://refspecs.linuxfoundation.org/fontconfig-2.6.0/index.html
+#[derive(Debug)]
 struct Font {
     name: String,
     h: i32,
@@ -119,14 +121,6 @@ impl Font {
         })
     }
 
-    fn renderable_prefix<'a>(&self, dpy: *mut Display, txt: &'a str) -> (&'a str, &'a str) {
-        if let Some(ix) = txt.find(|c| !self.contains_char(dpy, c)) {
-            txt.split_at(ix)
-        } else {
-            (txt, "")
-        }
-    }
-
     fn contains_char(&self, dpy: *mut Display, c: char) -> bool {
         unsafe { XftCharExists(dpy, self.xfont, c as u32) == 1 }
     }
@@ -155,10 +149,10 @@ impl Font {
     }
 
     /// Find a font that can handle a given character using fontconfig and this font's pattern
-    fn new_for_char(&self, dpy: *mut Display, c: char) -> Result<Self> {
+    fn fallback_for_char(&self, dpy: *mut Display, c: char) -> Result<Self> {
         let pat = self.fc_font_match(dpy, c)?;
 
-        Err(Error::NoFallbackFontForChar(c))
+        Font::try_new_from_pattern(dpy, pat)
     }
 
     fn fc_font_match(&self, dpy: *mut Display, c: char) -> Result<*mut FcPattern> {
@@ -196,6 +190,7 @@ impl Font {
     }
 }
 
+#[derive(Debug)]
 struct ColorScheme {
     name: String,
     fg: *mut XftColor,
@@ -260,17 +255,26 @@ pub struct Rect {
     pub h: u32,
 }
 
+#[derive(Debug, Copy, Clone)]
+enum FontMatch {
+    Primary,
+    Fallback(usize),
+}
+
+#[derive(Debug)]
 pub struct Draw {
     dpy: *mut Display,
     root: Window,
     drawable: Drawable,
     gc: GC,
+    fnt: Font,
+    fnt_fallback: Vec<Font>,
+    char_cache: HashMap<char, FontMatch>,
     schemes: Vec<ColorScheme>,
-    fonts: Vec<Font>,
 }
 
 impl Draw {
-    pub fn new(root: u32, w: u32, h: u32) -> Self {
+    pub fn new(root: u32, w: u32, h: u32, fnt: &str) -> Result<Self> {
         let root = root as Window;
         let (dpy, drawable, gc) = unsafe {
             let dpy = XOpenDisplay(std::ptr::null());
@@ -282,14 +286,16 @@ impl Draw {
             (dpy, drawable, gc)
         };
 
-        Self {
+        Ok(Self {
             dpy,
             root,
             drawable,
             gc,
+            fnt: Font::try_new_from_name(dpy, fnt)?,
+            fnt_fallback: Default::default(),
+            char_cache: Default::default(),
             schemes: Vec::new(),
-            fonts: Vec::new(),
-        }
+        })
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -303,17 +309,9 @@ impl Draw {
         }
     }
 
-    pub fn set_fonts(&mut self, font_names: &[&str]) -> Result<()> {
-        unsafe {
-            self.free_fonts();
-        }
-
-        let mut fonts = Vec::with_capacity(font_names.len());
-        for name in font_names {
-            fonts.push(Font::try_new_from_name(self.dpy, name)?);
-        }
-
-        self.fonts = fonts;
+    pub fn set_font(&mut self, font_name: &str) -> Result<()> {
+        unsafe { self.free_fonts() };
+        self.fnt = Font::try_new_from_name(self.dpy, font_name)?;
 
         Ok(())
     }
@@ -388,7 +386,7 @@ impl Draw {
             XftDrawStringUtf8(
                 d,
                 color,
-                self.fonts[0].xfont,
+                self.fnt.xfont,
                 x,
                 y,
                 c_str.as_ptr() as *mut u8,
@@ -400,10 +398,44 @@ impl Draw {
     }
 
     pub fn show_font_match_for_chars(&mut self, txt: &str) {
-        // Prioritise fonts based on their ordering
-        // -> when primary is active we are greedy
-        // -> when fallback is active we match single chars
-        // -> might want/need to look at https://crates.io/crates/fontconfig for fallback
+        for c in txt.chars() {
+            println!("'{c}' -> {:?}", self.fnt_for_char(c));
+        }
+    }
+
+    fn fnt_for_char(&mut self, c: char) -> FontMatch {
+        if let Some(fm) = self.char_cache.get(&c) {
+            return *fm;
+        }
+
+        if self.fnt.contains_char(self.dpy, c) {
+            self.char_cache.insert(c, FontMatch::Primary);
+            return FontMatch::Primary;
+        }
+
+        for (i, fnt) in self.fnt_fallback.iter().enumerate() {
+            if fnt.contains_char(self.dpy, c) {
+                self.char_cache.insert(c, FontMatch::Fallback(i));
+                return FontMatch::Fallback(i);
+            }
+        }
+
+        let fallback = match self.fnt.fallback_for_char(self.dpy, c) {
+            Ok(fnt) => {
+                self.fnt_fallback.push(fnt);
+                FontMatch::Fallback(self.fnt_fallback.len() - 1)
+            }
+
+            Err(e) => {
+                // TODO: add tracing to this crate
+                println!("ERROR: {e}");
+                FontMatch::Primary
+            }
+        };
+
+        self.char_cache.insert(c, fallback);
+
+        fallback
     }
 
     pub fn flush_to(&mut self, win: u32, Rect { x, y, w, h }: Rect) {
@@ -416,7 +448,10 @@ impl Draw {
     }
 
     unsafe fn free_fonts(&mut self) {
-        for f in self.fonts.drain(0..) {
+        self.char_cache.clear();
+        XftFontClose(self.dpy, self.fnt.xfont);
+
+        for f in self.fnt_fallback.drain(0..) {
             XftFontClose(self.dpy, f.xfont);
         }
     }
