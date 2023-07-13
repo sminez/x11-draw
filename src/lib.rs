@@ -6,8 +6,8 @@ use std::{
 use x11::{
     xft::{XftColor, XftColorAllocName, XftDrawCreate, XftDrawStringUtf8},
     xlib::{
-        CapButt, Display, Drawable, False, JoinMiter, LineSolid, Window, XCloseDisplay, XCopyArea,
-        XCreateGC, XCreatePixmap, XDefaultColormap, XDefaultDepth, XDefaultVisual, XDrawRectangle,
+        CapButt, Display, Drawable, False, JoinMiter, LineSolid, Window, XCopyArea, XCreateGC,
+        XCreatePixmap, XDefaultColormap, XDefaultDepth, XDefaultVisual, XDrawRectangle,
         XFillRectangle, XFreeGC, XFreePixmap, XOpenDisplay, XSetForeground, XSetLineAttributes,
         XSync, GC,
     },
@@ -17,7 +17,7 @@ pub(crate) const SCREEN: i32 = 0;
 
 mod fontset;
 
-use fontset::{FontMatch, Fontset};
+use fontset::Fontset;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -141,7 +141,7 @@ impl Draw {
             root,
             drawable,
             gc,
-            fs: Fontset::try_new(fnt)?,
+            fs: Fontset::try_new(dpy, fnt)?,
             schemes: Vec::new(),
         })
     }
@@ -158,7 +158,7 @@ impl Draw {
     }
 
     pub fn set_font(&mut self, font_name: &str) -> Result<()> {
-        self.fs = Fontset::try_new(font_name)?;
+        self.fs = Fontset::try_new(self.dpy, font_name)?;
 
         Ok(())
     }
@@ -229,21 +229,28 @@ impl Draw {
 
             let scheme = &self.schemes[0];
             let color = if invert { scheme.bg } else { scheme.fg };
-            let Rect { mut x, mut y, .. } = r;
-            // w -= lpad;
+            let Rect { mut x, y, h, .. } = r;
             x += lpad as i32;
-            y += lpad as i32;
-            let c_str = CString::new(txt).unwrap();
-            XftDrawStringUtf8(
-                d,
-                color,
-                // FIXME: need to use chunks and correct fonts
-                self.fs.fnt(FontMatch::Primary).xfont,
-                x,
-                y,
-                c_str.as_ptr() as *mut u8,
-                c_str.as_bytes().len() as i32,
-            );
+            // w -= lpad as i32;
+
+            for (chunk, fm) in self.fs.per_font_chunks(txt).into_iter() {
+                let fnt = self.fs.fnt(fm);
+                let (chunk_w, chunk_h) = fnt.get_exts(self.dpy, chunk);
+                let chunk_y = y + (h as i32 - chunk_h) / 2 + (*fnt.xfont).ascent;
+
+                let c_str = CString::new(chunk).unwrap();
+                XftDrawStringUtf8(
+                    d,
+                    color,
+                    self.fs.fnt(fm).xfont,
+                    x,
+                    chunk_y,
+                    c_str.as_ptr() as *mut _,
+                    c_str.as_bytes().len() as i32,
+                );
+
+                x += chunk_w;
+            }
         }
 
         Ok(())
@@ -276,7 +283,6 @@ impl Drop for Draw {
             XFreePixmap(self.dpy, self.drawable);
             XFreeGC(self.dpy, self.gc);
             self.free_colors();
-            XCloseDisplay(self.dpy);
         }
     }
 }

@@ -15,7 +15,7 @@ use x11::{
         FcPattern, FcResult, XftCharExists, XftFont, XftFontClose, XftFontMatch, XftFontOpenName,
         XftFontOpenPattern, XftNameParse, XftTextExtentsUtf8,
     },
-    xlib::{Display, XCloseDisplay, XOpenDisplay},
+    xlib::Display,
     xrender::XGlyphInfo,
 };
 
@@ -28,9 +28,7 @@ pub struct Fontset {
 }
 
 impl Fontset {
-    pub fn try_new(fnt: &str) -> Result<Self> {
-        let dpy = unsafe { XOpenDisplay(std::ptr::null()) };
-
+    pub fn try_new(dpy: *mut Display, fnt: &str) -> Result<Self> {
         Ok(Self {
             dpy,
             primary: Font::try_new_from_name(dpy, fnt)?,
@@ -48,7 +46,7 @@ impl Fontset {
 
     // Find boundaries where we need to change the font we are using for rendering utf8
     // characters from the given input.
-    fn per_font_chunks<'a>(&mut self, txt: &'a str) -> Vec<(&'a str, FontMatch)> {
+    pub(crate) fn per_font_chunks<'a>(&mut self, txt: &'a str) -> Vec<(&'a str, FontMatch)> {
         let mut char_indices = txt.char_indices();
         let mut chunks = Vec::new();
         let mut last_split = 0;
@@ -122,13 +120,12 @@ impl Fontset {
 
 impl Drop for Fontset {
     fn drop(&mut self) {
+        // SAFETY: the Display we have a pointer to is freed by the parent draw
         unsafe {
             XftFontClose(self.dpy, self.primary.xfont);
             for f in self.fallback.drain(0..) {
                 XftFontClose(self.dpy, f.xfont);
             }
-
-            XCloseDisplay(self.dpy);
         }
     }
 }
@@ -146,7 +143,7 @@ pub(crate) enum FontMatch {
 // https://refspecs.linuxfoundation.org/fontconfig-2.6.0/index.html
 #[derive(Debug)]
 pub(crate) struct Font {
-    h: i32,
+    pub(crate) h: i32,
     pub(crate) xfont: *mut XftFont,
     pattern: *mut FcPattern,
 }
@@ -193,7 +190,7 @@ impl Font {
         unsafe { XftCharExists(dpy, self.xfont, c as u32) == 1 }
     }
 
-    pub(crate) fn get_exts(&self, dpy: *mut Display, txt: &str) -> (u32, u32) {
+    pub(crate) fn get_exts(&self, dpy: *mut Display, txt: &str) -> (i32, i32) {
         unsafe {
             // https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html#tymethod.alloc
             let layout = Layout::new::<XGlyphInfo>();
@@ -212,7 +209,7 @@ impl Font {
                 ext,
             );
 
-            ((*ext).xOff as u32, self.h as u32)
+            ((*ext).xOff as i32, self.h)
         }
     }
 
