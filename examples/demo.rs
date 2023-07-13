@@ -6,9 +6,9 @@ use penrose::{
 };
 use x11_draw::{Draw, Rect};
 
-const X: u32 = 1500;
+const X: u32 = 200;
 const Y: u32 = 100;
-const W: u32 = 500;
+const W: u32 = 600;
 const H: u32 = 60;
 
 fn main() -> anyhow::Result<()> {
@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let mut drw = Draw::new(*conn.root(), W, H);
-    drw.set_fonts(&["ProFont For Powerline:size=10", "Iosevka Nerd Font:size=10"])?;
+    drw.set_fonts(&["ProFont For Powerline:size=14", "Iosevka Nerd Font:size=14"])?;
     drw.add_colorscheme("primary", "#f2e5bc", "#282828")?;
     drw.add_colorscheme("secondary", "#458588", "#b16286")?;
 

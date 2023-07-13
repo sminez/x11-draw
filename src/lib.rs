@@ -1,19 +1,27 @@
 //! About the smallest drawing API you could ask for
+use fontconfig_sys::{
+    constants::{FC_CHARSET, FC_SCALABLE},
+    FcCharSetAddChar, FcCharSetCreate, FcCharSetDestroy, FcConfig, FcConfigSubstitute,
+    FcDefaultSubstitute, FcMatchPattern, FcPatternAddBool, FcPatternAddCharSet, FcPatternDestroy,
+    FcPatternDuplicate,
+};
 use std::{
     alloc::{alloc, dealloc, handle_alloc_error, Layout},
-    ffi::CString,
+    ffi::{CStr, CString},
 };
 use x11::{
     xft::{
-        FcPattern, XftColor, XftColorAllocName, XftDrawCreate, XftFont, XftFontClose,
-        XftFontOpenName, XftNameParse,
+        FcPattern, FcResult, XftCharExists, XftColor, XftColorAllocName, XftDrawCreate,
+        XftDrawStringUtf8, XftFont, XftFontClose, XftFontMatch, XftFontOpenName,
+        XftFontOpenPattern, XftNameParse, XftNameUnparse, XftTextExtentsUtf8,
     },
     xlib::{
-        CapButt, Display, Drawable, False, JoinMiter, LineSolid, Window, XCopyArea, XCreateGC,
-        XCreatePixmap, XDefaultColormap, XDefaultDepth, XDefaultVisual, XDrawRectangle,
+        CapButt, Display, Drawable, False, JoinMiter, LineSolid, Window, XCloseDisplay, XCopyArea,
+        XCreateGC, XCreatePixmap, XDefaultColormap, XDefaultDepth, XDefaultVisual, XDrawRectangle,
         XFillRectangle, XFreeGC, XFreePixmap, XOpenDisplay, XSetForeground, XSetLineAttributes,
         XSync, GC,
     },
+    xrender::XGlyphInfo,
 };
 
 const SCREEN: i32 = 0;
@@ -26,11 +34,17 @@ pub enum Error {
     #[error("The provided font name contained an internal null byte")]
     InvalidFontName,
 
+    #[error("Unable to find a fallback font for '{0}'")]
+    NoFallbackFontForChar(char),
+
     #[error("Unable to allocate the requested color using Xft")]
     UnableToAllocateColor,
 
     #[error("Unable to open '{0}' as a font using Xft")]
     UnableToOpenFont(String),
+
+    #[error("Unable to open font from FcPattern using Xft")]
+    UnableToOpenFontPattern,
 
     #[error("Unable to parse '{0}' as an Xft font patten")]
     UnableToParseFontPattern(String),
@@ -43,10 +57,143 @@ type Result<T> = std::result::Result<T, Error>;
 
 // Fonts contain a resource that requires a Display to free on Drop so they
 // are owned by their parent Draw and cleaned up when the Draw is dropped
+//
+// https://man.archlinux.org/man/extra/libxft/XftFontMatch.3.en
+// https://refspecs.linuxfoundation.org/fontconfig-2.6.0/index.html
 struct Font {
+    name: String,
     h: i32,
     xfont: *mut XftFont,
-    pattern: *mut FcPattern,
+    pattern: Option<*mut FcPattern>,
+}
+
+impl Font {
+    fn try_new_from_name(dpy: *mut Display, name: &str) -> Result<Self> {
+        let (xfont, pattern, h) = unsafe {
+            let c_name = CString::new(name).map_err(|_| Error::InvalidFontName)?;
+            let xfont = XftFontOpenName(dpy, SCREEN, c_name.as_ptr());
+            if xfont.is_null() {
+                return Err(Error::UnableToOpenFont(name.to_string()));
+            }
+
+            let pattern = XftNameParse(c_name.as_ptr());
+            if pattern.is_null() {
+                XftFontClose(dpy, xfont);
+                return Err(Error::UnableToParseFontPattern(name.to_string()));
+            }
+
+            let h = (*xfont).ascent + (*xfont).descent;
+
+            (xfont, Some(pattern), h)
+        };
+
+        Ok(Font {
+            name: name.to_string(),
+            xfont,
+            pattern,
+            h,
+        })
+    }
+
+    fn try_new_from_pattern(dpy: *mut Display, pat: *mut FcPattern) -> Result<Self> {
+        let (name, xfont, h) = unsafe {
+            let xfont = XftFontOpenPattern(dpy, pat);
+            if xfont.is_null() {
+                return Err(Error::UnableToOpenFontPattern);
+            }
+
+            let h = (*xfont).ascent + (*xfont).descent;
+
+            let buffer = CString::new(vec![b' '; 1024]).unwrap();
+            XftNameUnparse(pat, buffer.as_ptr() as *mut _, 1024);
+            let name = buffer.into_string().expect("valid utf8");
+
+            (name, xfont, h)
+        };
+
+        Ok(Font {
+            name,
+            xfont,
+            pattern: None,
+            h,
+        })
+    }
+
+    fn renderable_prefix<'a>(&self, dpy: *mut Display, txt: &'a str) -> (&'a str, &'a str) {
+        if let Some(ix) = txt.find(|c| !self.contains_char(dpy, c)) {
+            txt.split_at(ix)
+        } else {
+            (txt, "")
+        }
+    }
+
+    fn contains_char(&self, dpy: *mut Display, c: char) -> bool {
+        unsafe { XftCharExists(dpy, self.xfont, c as u32) == 1 }
+    }
+
+    fn get_exts(&self, dpy: *mut Display, txt: &str) -> (u32, u32) {
+        unsafe {
+            // https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html#tymethod.alloc
+            let layout = Layout::new::<XGlyphInfo>();
+            let ptr = alloc(layout);
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            let ext = ptr as *mut XGlyphInfo;
+
+            let c_str = CString::new(txt).unwrap();
+            XftTextExtentsUtf8(
+                dpy,
+                self.xfont,
+                c_str.as_ptr() as *mut u8,
+                c_str.as_bytes().len() as i32,
+                ext,
+            );
+
+            ((*ext).xOff as u32, self.h as u32)
+        }
+    }
+
+    /// Find a font that can handle a given character using fontconfig and this font's pattern
+    fn new_for_char(&self, dpy: *mut Display, c: char) -> Result<Self> {
+        let pat = self.fc_font_match(dpy, c)?;
+
+        Err(Error::NoFallbackFontForChar(c))
+    }
+
+    fn fc_font_match(&self, dpy: *mut Display, c: char) -> Result<*mut FcPattern> {
+        unsafe {
+            let charset = FcCharSetCreate();
+            FcCharSetAddChar(charset, c as u32);
+
+            let pat = FcPatternDuplicate(self.pattern.unwrap() as *const _);
+            FcPatternAddCharSet(pat, FC_CHARSET.as_ptr(), charset);
+            FcPatternAddBool(pat, FC_SCALABLE.as_ptr(), 1); // FcTrue=1
+
+            FcConfigSubstitute(std::ptr::null::<FcConfig>() as *mut _, pat, FcMatchPattern);
+            FcDefaultSubstitute(pat);
+
+            // https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html#tymethod.alloc
+            let layout = Layout::new::<FcResult>();
+            let ptr = alloc(layout);
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            let res = ptr as *mut FcResult;
+
+            // Passing the pointer from fontconfig_sys to x11 here
+            let font_match = XftFontMatch(dpy, SCREEN, pat as *const _, res);
+
+            FcCharSetDestroy(charset);
+            FcPatternDestroy(pat);
+
+            if font_match.is_null() {
+                Err(Error::NoFallbackFontForChar(c))
+            } else {
+                Ok(font_match as *mut _)
+            }
+        }
+    }
 }
 
 struct ColorScheme {
@@ -56,12 +203,52 @@ struct ColorScheme {
 }
 
 impl ColorScheme {
+    // TODO: should accept impl Into<penrose::Color>
+    fn try_new(dpy: *mut Display, name: &str, fg: &str, bg: &str) -> Result<Self> {
+        let (fg, bg) = unsafe {
+            (
+                try_xftcolor_from_name(dpy, fg)?,
+                try_xftcolor_from_name(dpy, bg)?,
+            )
+        };
+
+        Ok(ColorScheme {
+            name: name.to_string(),
+            fg,
+            bg,
+        })
+    }
+
     unsafe fn fg(&self) -> u64 {
         (*self.fg).pixel
     }
 
     unsafe fn bg(&self) -> u64 {
         (*self.bg).pixel
+    }
+}
+
+unsafe fn try_xftcolor_from_name(dpy: *mut Display, color: &str) -> Result<*mut XftColor> {
+    // https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html#tymethod.alloc
+    let layout = Layout::new::<XftColor>();
+    let ptr = alloc(layout);
+    if ptr.is_null() {
+        handle_alloc_error(layout);
+    }
+
+    let c_name = CString::new(color).map_err(|_| Error::InvalidColorString)?;
+    let res = XftColorAllocName(
+        dpy,
+        XDefaultVisual(dpy, SCREEN),
+        XDefaultColormap(dpy, SCREEN),
+        c_name.as_ptr(),
+        ptr as *mut XftColor,
+    );
+
+    if res == 0 {
+        Err(Error::UnableToAllocateColor)
+    } else {
+        Ok(ptr as *mut XftColor)
     }
 }
 
@@ -117,11 +304,13 @@ impl Draw {
     }
 
     pub fn set_fonts(&mut self, font_names: &[&str]) -> Result<()> {
-        self.free_fonts();
+        unsafe {
+            self.free_fonts();
+        }
 
         let mut fonts = Vec::with_capacity(font_names.len());
         for name in font_names {
-            fonts.push(self.font_from_name(name)?);
+            fonts.push(Font::try_new_from_name(self.dpy, name)?);
         }
 
         self.fonts = fonts;
@@ -145,85 +334,11 @@ impl Draw {
         Ok(())
     }
 
-    fn free_fonts(&mut self) {
-        unsafe {
-            for f in self.fonts.drain(0..) {
-                XftFontClose(self.dpy, f.xfont);
-            }
-        }
-    }
-
-    fn font_from_name(&mut self, name: &str) -> Result<Font> {
-        let (xfont, pattern, h) = unsafe {
-            let c_name = CString::new(name).map_err(|_| Error::InvalidFontName)?;
-            let xfont = XftFontOpenName(self.dpy, SCREEN, c_name.as_ptr());
-            if xfont.is_null() {
-                return Err(Error::UnableToOpenFont(name.to_string()));
-            }
-
-            let pattern = XftNameParse(c_name.as_ptr());
-            if pattern.is_null() {
-                XftFontClose(self.dpy, xfont);
-                return Err(Error::UnableToParseFontPattern(name.to_string()));
-            }
-
-            let h = (*xfont).ascent + (*xfont).descent;
-
-            (xfont, pattern, h)
-        };
-
-        Ok(Font { xfont, pattern, h })
-    }
-
-    // TODO: should accept impl Into<penrose::Color>
     pub fn add_colorscheme(&mut self, name: &str, fg: &str, bg: &str) -> Result<()> {
-        let cs = ColorScheme {
-            name: name.to_string(),
-            fg: self.color_from_name(fg)?,
-            bg: self.color_from_name(bg)?,
-        };
+        let cs = ColorScheme::try_new(self.dpy, name, fg, bg)?;
         self.schemes.push(cs);
 
         Ok(())
-    }
-
-    fn color_from_name(&mut self, color: &str) -> Result<*mut XftColor> {
-        unsafe {
-            // https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html#tymethod.alloc
-            let layout = Layout::new::<XftColor>();
-            let ptr = alloc(layout);
-            if ptr.is_null() {
-                handle_alloc_error(layout);
-            }
-
-            let c_name = CString::new(color).map_err(|_| Error::InvalidColorString)?;
-            let res = XftColorAllocName(
-                self.dpy,
-                XDefaultVisual(self.dpy, SCREEN),
-                XDefaultColormap(self.dpy, SCREEN),
-                c_name.as_ptr(),
-                ptr as *mut XftColor,
-            );
-
-            if res == 0 {
-                Err(Error::UnableToAllocateColor)
-            } else {
-                Ok(ptr as *mut XftColor)
-            }
-        }
-    }
-
-    fn free_colors(&mut self) {
-        unsafe {
-            let layout = Layout::new::<XftColor>();
-
-            for ColorScheme { fg, bg, .. } in self.schemes.drain(0..) {
-                for ptr in [fg, bg] {
-                    // TODO: check if this should be done use XftFreeColor
-                    dealloc(ptr as *mut u8, layout);
-                }
-            }
-        }
     }
 
     pub fn draw_rect(&mut self, Rect { x, y, w, h }: Rect, inverted: bool) -> Result<()> {
@@ -250,25 +365,45 @@ impl Draw {
         Ok(())
     }
 
+    // https://keithp.com/~keithp/talks/xtc2001/xft.pdf
+    // https://keithp.com/~keithp/render/Xft.tutorial
     pub fn draw_text(&mut self, txt: &str, lpad: u32, r: Rect, invert: bool) -> Result<()> {
         self.fill_rect(r, !invert)?; // !invert so we get the other color
 
-        let d = unsafe {
-            XftDrawCreate(
+        unsafe {
+            let d = XftDrawCreate(
                 self.dpy,
                 self.drawable,
                 XDefaultVisual(self.dpy, SCREEN),
                 XDefaultColormap(self.dpy, SCREEN),
-            )
-        };
+            );
 
-        let Rect { mut x, y, mut w, h } = r;
-        w += lpad;
-        x -= lpad as i32;
-
-        todo!("deal with strings and font rendering in C");
+            let scheme = &self.schemes[0];
+            let color = if invert { scheme.bg } else { scheme.fg };
+            let Rect { mut x, mut y, .. } = r;
+            // w -= lpad;
+            x += lpad as i32;
+            y += lpad as i32;
+            let c_str = CString::new(txt).unwrap();
+            XftDrawStringUtf8(
+                d,
+                color,
+                self.fonts[0].xfont,
+                x,
+                y,
+                c_str.as_ptr() as *mut u8,
+                c_str.as_bytes().len() as i32,
+            );
+        }
 
         Ok(())
+    }
+
+    pub fn show_font_match_for_chars(&mut self, txt: &str) {
+        // Prioritise fonts based on their ordering
+        // -> when primary is active we are greedy
+        // -> when fallback is active we match single chars
+        // -> might want/need to look at https://crates.io/crates/fontconfig for fallback
     }
 
     pub fn flush_to(&mut self, win: u32, Rect { x, y, w, h }: Rect) {
@@ -277,6 +412,23 @@ impl Draw {
         unsafe {
             XCopyArea(self.dpy, self.drawable, win, self.gc, x, y, w, h, x, y);
             XSync(self.dpy, False);
+        }
+    }
+
+    unsafe fn free_fonts(&mut self) {
+        for f in self.fonts.drain(0..) {
+            XftFontClose(self.dpy, f.xfont);
+        }
+    }
+
+    unsafe fn free_colors(&mut self) {
+        let layout = Layout::new::<XftColor>();
+
+        for ColorScheme { fg, bg, .. } in self.schemes.drain(0..) {
+            for ptr in [fg, bg] {
+                // TODO: check if this should be done use XftFreeColor
+                dealloc(ptr as *mut u8, layout);
+            }
         }
     }
 }
@@ -288,6 +440,7 @@ impl Drop for Draw {
             XFreeGC(self.dpy, self.gc);
             self.free_colors();
             self.free_fonts();
+            XCloseDisplay(self.dpy);
         }
     }
 }

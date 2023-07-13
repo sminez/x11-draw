@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 thiserror = "1.0.43"
 x11 = { version = "2.21.0", features = ["xft", "xlib"] }
+yeslogic-fontconfig-sys = "4.0.1"
 
 [dev-dependencies]
 anyhow = "1.0.71"
