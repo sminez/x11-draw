@@ -1,7 +1,7 @@
 //! About the smallest drawing API you could ask for
 use std::{
     alloc::{alloc, dealloc, handle_alloc_error, Layout},
-    ffi::CString,
+    ffi::{CString, NulError},
 };
 use x11::{
     xft::{XftColor, XftColorAllocName, XftDrawCreate, XftDrawStringUtf8},
@@ -13,22 +13,18 @@ use x11::{
     },
 };
 
-pub(crate) const SCREEN: i32 = 0;
-
 mod fontset;
-
 use fontset::Fontset;
+
+pub(crate) const SCREEN: i32 = 0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("The provided color string contained an internal null byte")]
-    InvalidColorString,
-
-    #[error("The provided font name contained an internal null byte")]
-    InvalidFontName,
-
     #[error("Unable to find a fallback font for '{0}'")]
     NoFallbackFontForChar(char),
+
+    #[error(transparent)]
+    NulError(#[from] NulError),
 
     #[error("Unable to allocate the requested color using Xft")]
     UnableToAllocateColor,
@@ -89,7 +85,7 @@ unsafe fn try_xftcolor_from_name(dpy: *mut Display, color: &str) -> Result<*mut 
         handle_alloc_error(layout);
     }
 
-    let c_name = CString::new(color).map_err(|_| Error::InvalidColorString)?;
+    let c_name = CString::new(color)?;
     let res = XftColorAllocName(
         dpy,
         XDefaultVisual(dpy, SCREEN),
@@ -105,6 +101,7 @@ unsafe fn try_xftcolor_from_name(dpy: *mut Display, color: &str) -> Result<*mut 
     }
 }
 
+// TODO: just use the penrose Rect struct once this is moved over
 #[derive(Debug, Copy, Clone)]
 pub struct Rect {
     pub x: i32,
@@ -211,9 +208,13 @@ impl Draw {
     }
 
     pub fn show_font_match_for_chars(&mut self, txt: &str) {
-        self.fs.show_font_match_for_chars(txt)
+        for (chunk, fm) in self.fs.per_font_chunks(txt) {
+            let ext = self.fs.fnt(fm).get_exts(self.dpy, chunk);
+            println!("{fm:?} [extent: {ext:?}] -> '{chunk}'");
+        }
     }
 
+    // TODO: Need to bounds checks
     // https://keithp.com/~keithp/talks/xtc2001/xft.pdf
     // https://keithp.com/~keithp/render/Xft.tutorial
     pub fn draw_text(&mut self, txt: &str, lpad: u32, r: Rect, invert: bool) -> Result<()> {
@@ -231,11 +232,10 @@ impl Draw {
             let color = if invert { scheme.bg } else { scheme.fg };
             let Rect { mut x, y, h, .. } = r;
             x += lpad as i32;
-            // w -= lpad as i32;
 
             for (chunk, fm) in self.fs.per_font_chunks(txt).into_iter() {
                 let fnt = self.fs.fnt(fm);
-                let (chunk_w, chunk_h) = fnt.get_exts(self.dpy, chunk);
+                let (chunk_w, chunk_h) = fnt.get_exts(self.dpy, chunk)?;
                 let chunk_y = y + (h as i32 - chunk_h) / 2 + (*fnt.xfont).ascent;
 
                 let c_str = CString::new(chunk).unwrap();
@@ -256,6 +256,17 @@ impl Draw {
         Ok(())
     }
 
+    pub fn text_extent(&mut self, txt: &str) -> Result<(i32, i32)> {
+        let (mut w, mut h) = (0, 0);
+        for (chunk, fm) in self.fs.per_font_chunks(txt) {
+            let (cw, ch) = self.fs.fnt(fm).get_exts(self.dpy, chunk)?;
+            w += cw;
+            h += ch;
+        }
+
+        Ok((w, h))
+    }
+
     pub fn flush_to(&mut self, win: u32, Rect { x, y, w, h }: Rect) {
         let win = win as Window;
 
@@ -270,7 +281,6 @@ impl Draw {
 
         for ColorScheme { fg, bg, .. } in self.schemes.drain(0..) {
             for ptr in [fg, bg] {
-                // TODO: check if this should be done use XftFreeColor
                 dealloc(ptr as *mut u8, layout);
             }
         }
@@ -286,6 +296,3 @@ impl Drop for Draw {
         }
     }
 }
-
-// unsigned int drw_fontset_getwidth(Drw *drw, const char *text);
-// void drw_font_getexts(Fnt *font, const char *text, unsigned int len, unsigned int *w, unsigned int *h);

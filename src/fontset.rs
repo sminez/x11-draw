@@ -20,7 +20,7 @@ use x11::{
 };
 
 #[derive(Debug)]
-pub struct Fontset {
+pub(crate) struct Fontset {
     dpy: *mut Display,
     primary: Font,
     fallback: Vec<Font>,
@@ -28,20 +28,13 @@ pub struct Fontset {
 }
 
 impl Fontset {
-    pub fn try_new(dpy: *mut Display, fnt: &str) -> Result<Self> {
+    pub(crate) fn try_new(dpy: *mut Display, fnt: &str) -> Result<Self> {
         Ok(Self {
             dpy,
             primary: Font::try_new_from_name(dpy, fnt)?,
             fallback: Default::default(),
             char_cache: Default::default(),
         })
-    }
-
-    pub fn show_font_match_for_chars(&mut self, txt: &str) {
-        for (chunk, fm) in self.per_font_chunks(txt) {
-            let ext = self.fnt(fm).get_exts(self.dpy, chunk);
-            println!("{fm:?} [extent: {ext:?}] -> '{chunk}'");
-        }
     }
 
     // Find boundaries where we need to change the font we are using for rendering utf8
@@ -151,7 +144,7 @@ pub(crate) struct Font {
 impl Font {
     fn try_new_from_name(dpy: *mut Display, name: &str) -> Result<Self> {
         let (xfont, pattern, h) = unsafe {
-            let c_name = CString::new(name).map_err(|_| Error::InvalidFontName)?;
+            let c_name = CString::new(name)?;
             let xfont = XftFontOpenName(dpy, SCREEN, c_name.as_ptr());
             if xfont.is_null() {
                 return Err(Error::UnableToOpenFont(name.to_string()));
@@ -190,7 +183,7 @@ impl Font {
         unsafe { XftCharExists(dpy, self.xfont, c as u32) == 1 }
     }
 
-    pub(crate) fn get_exts(&self, dpy: *mut Display, txt: &str) -> (i32, i32) {
+    pub(crate) fn get_exts(&self, dpy: *mut Display, txt: &str) -> Result<(i32, i32)> {
         unsafe {
             // https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html#tymethod.alloc
             let layout = Layout::new::<XGlyphInfo>();
@@ -200,7 +193,7 @@ impl Font {
             }
             let ext = ptr as *mut XGlyphInfo;
 
-            let c_str = CString::new(txt).expect("text to not contain null bytes");
+            let c_str = CString::new(txt)?;
             XftTextExtentsUtf8(
                 dpy,
                 self.xfont,
@@ -209,7 +202,7 @@ impl Font {
                 ext,
             );
 
-            ((*ext).xOff as i32, self.h)
+            Ok(((*ext).xOff as i32, self.h))
         }
     }
 

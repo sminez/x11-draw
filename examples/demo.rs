@@ -6,17 +6,20 @@ use penrose::{
 };
 use x11_draw::{Draw, Rect};
 
-const X: u32 = 200;
-const Y: u32 = 100;
+const DX: u32 = 100;
+const DY: u32 = 100;
 const W: u32 = 600;
 const H: u32 = 60;
 const FONT: &str = "ProFont For Powerline:size=14";
 
 fn main() -> anyhow::Result<()> {
     let conn = RustConn::new()?;
+    let screen_rects = conn.screen_details()?;
+    let PRect { x, y, .. } = screen_rects.last().unwrap();
+
     let w = conn.create_window(
         WinType::InputOutput(Atom::NetWindowTypeDock),
-        PRect::new(X, Y, W, H),
+        PRect::new(x + DX, y + DY, W, H),
         false,
     )?;
 
