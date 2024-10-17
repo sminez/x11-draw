@@ -1,5 +1,7 @@
 # README
 
+> :warning: This repo is now archived. The relevant updated code now lives in [penrose][0] :warning:
+
 This is a bare bones text-based graphics library intended for use with the `penrose` window
 manager library for rendering the status bar. The current state of this repo is a proof of
 concept for the API before integrating with the existing `penrose_ui` crate.
@@ -17,3 +19,5 @@ This crate is a thin wrapper around xlib, xft and fontconfig.
 > This repo will not be published to crates.io as a crate. It is going to be inlined into
 > the existing `penrose_ui` crate and is provided here as a stand alone example of a
 > minimal graphics layer.
+
+  [0]: https://github.com/sminez/penrose
